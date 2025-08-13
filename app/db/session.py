@@ -1,24 +1,45 @@
 ﻿from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.pool import NullPool
-from urllib.parse import quote_plus
+from sqlalchemy.engine import URL
 from app.config import settings
+import ssl, certifi
 
-if settings.DATABASE_URL:
-    DB_URL = settings.DATABASE_URL
+user = (settings.PGUSER or "").strip()
+pwd  = settings.PGPASSWORD or ""
+host = (settings.PGHOST or "").strip()
+port = settings.PGPORT or 5432
+db   = (settings.PGDATABASE or "").strip()
 
-elif settings.PGUSER and settings.PGPASSWORD and settings.PGHOST and settings.PGDATABASE:
-    pwd = quote_plus(settings.PGPASSWORD)
-    DB_URL = f"postgresql+asyncpg://{settings.PGUSER}:{pwd}@{settings.PGHOST}:{settings.PGPORT}/{settings.PGDATABASE}"
+is_cloud = all([user, pwd, host, db])
+is_pooler = "pooler.supabase.com" in host or "pgbouncer" in host
+
+if is_cloud:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    query = {}
+    if is_pooler:
+        query["prepared_statement_cache_size"] = "0"
+
+    url = URL.create(
+        "postgresql+asyncpg",
+        username=user,
+        password=pwd,
+        host=host,
+        port=port,
+        database=db,
+        query=query
+    )
+
+    connect_args = {"ssl": ssl_ctx}
+    if is_pooler:
+        connect_args["statement_cache_size"] = 0
+
+    engine = create_async_engine(
+        url,
+        pool_pre_ping=True,
+        connect_args=connect_args,
+    )
 
 else:
-    DB_URL = "sqlite+aiosqlite:///./app.db"
+    from sqlalchemy.ext.asyncio import create_async_engine as _create
+    engine = _create("sqlite+aiosqlite:///./app.db", pool_pre_ping=True)
 
-print("[DB] Using:", DB_URL.split('://')[0], "→", ("cloud" if "postgresql+asyncpg" in DB_URL else "sqlite"))
-
-engine = create_async_engine(
-    DB_URL,
-    pool_pre_ping=True,
-    poolclass=NullPool,
-    connect_args={"statement_cache_size": 0, "timeout": 60},
-)
 Session: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
