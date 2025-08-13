@@ -29,6 +29,9 @@ async def start(message: Message):
 
 async def main():
     await init_db_and_load_cache()
+    info = await bot.get_webhook_info()
+    if info.url:
+        await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 
