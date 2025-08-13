@@ -1,5 +1,6 @@
-﻿from itertools import product
+﻿import asyncio
 
+from sqlalchemy import text
 from sqlalchemy import select
 from app.db.session import engine, Session
 from app.db.models import Base, Category, Stone, Product
@@ -44,3 +45,13 @@ async def init_db_and_load_cache():
     await init_db()
     await ensure_base_ref_data()
     await load_catalog_to_memory()
+
+
+async def warmup_db_pool():
+    sessions = [Session() for _ in range(5)]
+    try:
+        await asyncio.gather(*[
+            s.execute(text("SELECT 1")) for s in sessions
+        ])
+    finally:
+        await asyncio.gather(*[s.close() for s in sessions])
