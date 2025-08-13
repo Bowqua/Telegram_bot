@@ -4,7 +4,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from app.config import settings
-from app.db.bootstrap import init_db_and_load_cache, warmup_db_pool
+from app.db.bootstrap import init_db_and_load_cache
 from app.handlers.callbacks import router as cb_router
 
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -29,7 +29,6 @@ async def start(message: Message):
 
 async def main():
     await init_db_and_load_cache()
-    await warmup_db_pool()
     await dp.start_polling(bot)
 
 
