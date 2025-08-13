@@ -1,5 +1,4 @@
-﻿# app/db/session.py
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+﻿from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.pool import NullPool
 from urllib.parse import quote_plus
 from uuid import uuid4
@@ -9,7 +8,7 @@ from app.config import settings
 user = settings.PGUSER.strip()
 pwd  = quote_plus(settings.PGPASSWORD)
 host = settings.PGHOST.strip()
-port = int(settings.PGPORT or 6543)
+port = int(settings.PGPORT)
 db   = settings.PGDATABASE.strip()
 
 DB_URL = f"postgresql+asyncpg://{user}:{pwd}@{host}:{port}/{db}?prepared_statement_cache_size=0"
