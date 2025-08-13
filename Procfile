@@ -1,1 +1,0 @@
-﻿start: python -m app.main

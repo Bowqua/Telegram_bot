@@ -4,8 +4,15 @@ from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID
 from aiogram.filters import Command, CommandObject, BaseFilter
-from app.db.repo import add_product_db, delete_product_db, set_stock_db
 from app.db.bootstrap import load_catalog_to_memory
+import asyncio, shlex
+from decimal import Decimal
+from typing import List, Tuple
+from aiogram.types import Message
+from sqlalchemy import select, func
+from app.db.session import Session
+from app.db.models import Category, Stone, Product
+from app.utils.slug import slugify_ru
 
 REMOVE_ON_ZERO = True
 SHOW_DELETE_BUTTON = False
@@ -45,6 +52,118 @@ async def safe_edit(message, text, reply_markup):
 class WaitsInput(BaseFilter):
     async def __call__(self, m: Message) -> bool:
         return INPUT_MODE.get(m.from_user.id) is not None
+
+
+async def _ru_labels(category_code: str, stone_code: str) -> tuple[str, str]:
+    async with Session() as s:
+        cat_ru = (await s.execute(
+            select(Category.name_ru).where(Category.code == category_code)
+        )).scalar_one_or_none() or category_code
+        stone_ru = (await s.execute(
+            select(Stone.name_ru).where(Stone.code == stone_code)
+        )).scalar_one_or_none() or stone_code
+    return cat_ru, stone_ru
+
+
+async def create_or_get_category(session: Session, name_ru: str) -> Category:
+    name_ru = name_ru.strip()
+    c = (await session.execute(
+        select(Category).where(func.lower(Category.name_ru) == func.lower(name_ru))
+    )).scalar_one_or_none()
+
+    if c:
+        return c
+    code = slugify_ru(name_ru)
+    postfix = 1
+    base = code
+
+    while (await session.execute(select(Category).where(Category.code == code))).scalar_one_or_none():
+        postfix += 1
+        code = f"{base}-{postfix}"
+
+    c = Category(code=code, name_ru=name_ru)
+    session.add(c)
+    await session.flush()
+    return c
+
+
+async def create_or_get_stone(session: Session, name_ru: str) -> Stone:
+    name_ru = name_ru.strip()
+    s = (await session.execute(
+        select(Stone).where(func.lower(Stone.name_ru) == func.lower(name_ru))
+    )).scalar_one_or_none()
+
+    if s:
+        return s
+    code = slugify_ru(name_ru)
+    postfix = 1
+    base = code
+
+    while (await session.execute(select(Stone).where(Stone.code == code))).scalar_one_or_none():
+        postfix += 1
+        code = f"{base}-{postfix}"
+
+    s = Stone(code=code, name_ru=name_ru)
+    session.add(s)
+    await session.flush()
+    return s
+
+
+async def add_product_from_args(m: Message, args: str, photos: List[str] | None):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        return await m.answer('Неверный синтаксис. Пример:\n'
+                              '/add браслеты аметист "Браслет Морозный" 3990 4 "Описание (опционально)"')
+
+    if len(parts) < 5:
+        return await m.answer('Нужно минимум 5 параметров:\n'
+                              '/add <категория> <камень> "<Название>" <цена> <шт> ["Описание"]')
+
+    cat_ru, stone_ru = parts[0], parts[1]
+    title = parts[2]
+    try:
+        price = int(Decimal(parts[3]))
+        stock = int(parts[4])
+    except Exception:
+        return await m.answer("Цена/количество должны быть числами.")
+
+    description = parts[5] if len(parts) > 5 else None
+    photos = (photos or [])[:5]
+
+    async with Session() as s:
+        cat = await create_or_get_category(s, cat_ru)
+        stn = await create_or_get_stone(s, stone_ru)
+
+        exists = (await s.execute(
+            select(Product.id)
+            .where(Product.category_id == cat.id)
+            .where(Product.stone_id == stn.id)
+            .where(func.lower(Product.title) == func.lower(title))
+        )).scalar_one_or_none()
+        if exists:
+            return await m.answer("Этот товар уже добавлен.")
+
+        p = Product(
+            title=title, price=price, stock=stock,
+            category_id=cat.id, stone_id=stn.id,
+            description=description, photos=photos
+        )
+
+        s.add(p)
+        await s.commit()
+        await s.refresh(p)
+    await load_catalog_to_memory()
+
+    await m.answer(
+        f"Добавлено: #{p.id}\n"
+        f"{cat.name_ru} / {stn.name_ru}\n"
+        f"{p.title} — {p.price} ₽, {p.stock} шт."
+        + (f"\nОписание: {description}" if description else "")
+        + (f"\nФото: {len(photos)}" if photos else "")
+    )
 
 
 def delivery_back_only_keyboard():
@@ -133,9 +252,12 @@ async def render_product_screen(cb: CallbackQuery, category: str, stone: str, id
     USER_CTX[cb.from_user.id] = {"key": key, "idx": idx}
     p = products[idx]
 
-    await safe_edit(cb.message, render_product_text(p, idx, len(products), category, stone),
-            product_keyboard(category, stone, p["id"], cb.from_user.id, idx, len(products)))
-
+    cat_ru, stone_ru = await _ru_labels(category, stone)
+    await safe_edit(
+        cb.message,
+        render_product_text(p, idx, len(products), cat_ru, stone_ru),  # ← ПЕРЕДАЁМ РУССКИЕ
+        product_keyboard(category, stone, p["id"], cb.from_user.id, idx, len(products))
+    )
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(cb: CallbackQuery):
@@ -161,18 +283,25 @@ async def cb_contacts(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("catalog1|"))
 async def cb_catalog1(cb: CallbackQuery):
-    cats = sorted({cat for (cat, _stone) in PRODUCTS.keys()})
-    if not cats:
+    codes = sorted({cat for (cat, _stone) in PRODUCTS.keys()})
+    if not codes:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")]
-        ])
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")]
+                ])
         await cb.message.edit_text("Пока нет категорий.", reply_markup=kb)
         return await cb.answer()
 
-    rows = [[InlineKeyboardButton(text=cat, callback_data=f"catalog2|open|{cat}")] for cat in cats]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
-
-    await cb.message.edit_text("Выберите ассортимент:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Category.code, Category.name_ru).where(Category.code.in_(codes))
+        )).all()
+    labels = {code: name_ru for code, name_ru in rows}
+    rows_kb = [[InlineKeyboardButton(text=labels.get(code, code),
+                                     callback_data=f"catalog2|open|{code}")]
+               for code in codes]
+    rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
+    await cb.message.edit_text("Выберите ассортимент:",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb))
     return await cb.answer()
 
 
@@ -189,12 +318,17 @@ async def cb_catalog2(cb: CallbackQuery):
                                    reply_markup=kb)
         return await cb.answer()
 
-    rows = [[InlineKeyboardButton(text=stone, callback_data=f"product|open|{category}:{stone}")]
-            for stone in stones]
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
-
-    await cb.message.edit_text(f"Выберите камень для категории: {category}",
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Stone.code, Stone.name_ru).where(Stone.code.in_(stones))
+        )).all()
+    labels = {code: name_ru for code, name_ru in rows}
+    rows_kb = [[InlineKeyboardButton(text=labels.get(st, st),
+                                     callback_data=f"product|open|{category}:{st}")]
+               for st in stones]
+    rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
+    await cb.message.edit_text("Выберите камень для категории:",
+                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb))
     return await cb.answer()
 
 
@@ -584,87 +718,131 @@ async def cmd_admin_help(m: Message):
         return await m.answer("⛔ Нет доступа.")
     await m.answer(
         "Админ-команды:\n"
-        "<code>/add_item &lt;категория&gt; &lt;камень&gt; &lt;название&gt; | &lt;цена&gt; | &lt;остаток&gt;</code>\n"
-        "<code>/del_item &lt;id&gt;</code>\n"
-        "<code>/set_stock &lt;id&gt; &lt;кол-во&gt;</code>\n"
-        "<code>/list_items &lt;категория&gt; &lt;камень&gt;</code>\n\n"
-        "Пример:\n"
-        "<code>/add_item bracelets amethyst Браслет «Лавандовый» | 3500 | 5</code>"
+        "<code>/add &lt;категория&gt; &lt;камень&gt; \"Название\" &lt;цена&gt; &lt;остаток&gt; [\"Описание\"]</code>\n"
+        "<code>/del &lt;id&gt;</code>\n"
+        "<code>/set &lt;id&gt; &lt;кол-во&gt;</code>\n"
+        "<code>/list</code>\n\n"
+        "Примеры:\n"
+        "<code>/add браслеты аметист \"Браслет Морозный\" 3990 4 \"Серебро 925\"</code>\n"
+        "<code>/del 42</code>\n"
+        "<code>/set 42 7</code>"
     )
 
 
-@router.message(Command("add_item"))
-async def cmd_add_item(m: Message, command: CommandObject):
+@router.message(Command("add"))
+async def admin_add_text(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
-        return await m.answer("⛔ Нет доступа.")
-    if not command.args:
-        return await m.answer("Формат: /add_item <категория> <камень> <название> | <цена> | <остаток>")
-    try:
-        head, price_s, stock_s = [x.strip() for x in command.args.split("|")]
-        category, stone, title = head.split(maxsplit=2)
-        price = int(price_s); stock = int(stock_s)
-    except Exception:
-        return await m.answer("Ошибка парсинга. Пример:\n/add_item bracelets amethyst Браслет X | 3500 | 5")
-
-    pid = await add_product_db(category, stone, title, price, stock)
-    item = {"id": pid, "title": title.strip(), "price": price, "stock": stock}
-    PRODUCTS.setdefault((category, stone), []).append(item)
-    PRODUCTS_BY_ID[pid] = item
-
-    return await m.answer(f"✅ Добавлено: id={pid}\n{category}/{stone}: {title} — {price} ₽, остаток {stock}")
+        return
+    await add_product_from_args(m, command.args or "", photos=[])
 
 
-@router.message(Command("del_item"))
-async def cmd_del_item(m: Message, command: CommandObject):
+@router.message(Command("del"))
+async def admin_del(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
-        return await m.answer("⛔ Нет доступа.")
+        return
     if not command.args:
-        return await m.answer("Формат: /del_item <id>")
+        return await m.answer("Формат: /del <id>")
+
     try:
         pid = int(command.args.strip())
     except ValueError:
-        return await m.answer("id должен быть числом")
+        return await m.answer("ID должен быть числом.")
 
-    ok = await delete_product_db(pid)
-    if not ok:
-        return await m.answer("Не найдено")
+    async with Session() as s:
+        p = await s.get(Product, pid)
+        if not p:
+            return await m.answer("Товар не найден.")
+        await s.delete(p)
+        await s.commit()
+        await load_catalog_to_memory()
 
-    # память:
-    delete_product_mem(pid)
+    await m.answer(f"Удалено: #{pid}")
 
 
-@router.message(Command("set_stock"))
-async def cmd_set_stock(m: Message, command: CommandObject):
+@router.message(Command("set"))
+async def admin_set(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
-        return await m.answer("⛔ Нет доступа.")
+        return
     if not command.args:
-        return await m.answer("Формат: /set_stock <id> <кол-во>")
+        return await m.answer("Формат: /set <id> <stock>  (например: /set 42 7)")
+
+    parts = command.args.split()
+    if len(parts) != 2:
+        return await m.answer("Формат: /set <id> <stock>")
+
     try:
-        pid_s, qty_s = command.args.split()
-        pid, qty = int(pid_s), int(qty_s)
-    except Exception:
-        return await m.answer("Пример: /set_stock 101 7")
+        pid = int(parts[0]); new_stock = int(parts[1])
+    except ValueError:
+        return await m.answer("ID и stock должны быть числами.")
 
-    ok = await set_stock_db(pid, qty)
-    if not ok:
-        return await m.answer("Не найдено")
+    async with Session() as s:
+        p = await s.get(Product, pid)
+        if not p:
+            return await m.answer("Товар не найден.")
+        p.stock = new_stock
+        await s.commit()
+        await load_catalog_to_memory()
 
-    set_stock_mem(pid, qty)
-    return await m.answer("✅ Ок")
+    await m.answer(f"#{pid}: новое количество = {new_stock}")
 
 
-@router.message(Command("list_items"))
-async def cmd_list_items(m: Message, command: CommandObject):
+
+@router.message(Command("list"))
+async def admin_list(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
-        return await m.answer("⛔ Нет доступа.")
-    if not command.args:
-        return await m.answer("Формат: /list_items <категория> <камень>")
-    try:
-        category, stone = command.args.split()
-    except Exception:
-        return await m.answer("Пример: /list_items bracelets amethyst")
-    items = PRODUCTS.get((category, stone), [])
-    if not items:
-        return await m.answer("Пусто.")
-    lines = [f"{p['id']}: {p['title']} — {p['price']} ₽ (остаток {p['stock']})" for p in items]
-    await m.answer("\n".join(lines[:50]))
+        return
+    async with Session() as s:
+        rows = (await s.execute(
+            select(Product, Category.name_ru, Stone.name_ru)
+            .join(Category, Product.category_id == Category.id)
+            .join(Stone, Product.stone_id == Stone.id)
+            .order_by(Product.id.desc())
+            .limit(30)
+        )).all()
+    if not rows:
+        return await m.answer("Список пуст.")
+    lines = []
+    for p, cat_ru, stone_ru in rows:
+        lines.append(f"#{p.id} • {cat_ru} / {stone_ru}\n{p.title} — {p.price} ₽, {p.stock} шт.")
+    await m.answer("\n\n".join(lines))
+
+
+@router.message(F.photo)
+async def admin_add_single_photo(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    if not m.caption or not m.caption.lstrip().startswith("/add"):
+        return
+    args = m.caption.lstrip()[len("/add"):].strip()
+    photos = [m.photo[-1].file_id]
+    await add_product_from_args(m, args, photos)
+
+
+ALBUM_BUF: dict[Tuple[int, str], dict] = {}
+
+async def _flush_album(key: Tuple[int, str]):
+    await asyncio.sleep(1.0)
+    buf = ALBUM_BUF.pop(key, None)
+    if not buf:
+        return
+    m0: Message = buf["first_msg"]
+    caption: str | None = buf.get("caption")
+    photos: list[str] = buf.get("photos", [])[:5]
+    if not caption or not caption.lstrip().startswith("/add"):
+        return
+    args = caption.lstrip()[len("/add"):].strip()
+    await add_product_from_args(m0, args, photos)
+
+
+@router.message(F.media_group_id & F.photo)
+async def admin_add_album(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    key = (m.chat.id, m.media_group_id)
+    buf = ALBUM_BUF.get(key)
+    if not buf:
+        buf = ALBUM_BUF[key] = {"photos": [], "caption": None, "first_msg": m}
+        asyncio.create_task(_flush_album(key))
+    buf["photos"].append(m.photo[-1].file_id)
+    if m.caption and m.caption.lstrip().startswith("/add"):
+        buf["caption"] = m.caption
