@@ -1,4 +1,9 @@
-﻿import asyncio
+﻿import sys, asyncio
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.types import Message
@@ -29,9 +34,7 @@ async def start(message: Message):
 
 async def main():
     await init_db_and_load_cache()
-    info = await bot.get_webhook_info()
-    if info.url:
-        await bot.delete_webhook(drop_pending_updates=False)
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 

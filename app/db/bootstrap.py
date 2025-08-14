@@ -45,18 +45,35 @@ async def ensure_base_ref_data():
 async def load_catalog_to_memory():
     catalog.PRODUCTS.clear()
     catalog.PRODUCTS_BY_ID.clear()
+    catalog.CAT_LABELS.clear()
+    catalog.STONE_LABELS.clear()
+
     async with Session() as session:
-        cats = {c.id: c.code for c in (await session.execute(select(Category))).scalars().all()}
-        stns = {st.id: st.code for st in (await session.execute(select(Stone))).scalars().all()}
-        products = (await session.execute(select(Product))).scalars().all()
-        for p in products:
-            category = cats.get(p.category_id)
-            stone = stns.get(p.stone_id)
-            if not category or not stone:
+        cats = (await session.execute(select(Category))).scalars().all()
+        stns = (await session.execute(select(Stone))).scalars().all()
+        prods = (await session.execute(select(Product))).scalars().all()
+
+        id2cat = {c.id: c.code for c in cats}
+        id2stn = {s.id: s.code for s in stns}
+        for c in cats:
+            catalog.CAT_LABELS[c.code] = c.name_ru or c.code
+        for s in stns:
+            catalog.STONE_LABELS[s.code] = s.name_ru or s.code
+
+        for p in prods:
+            cat_code = id2cat.get(p.category_id)
+            stn_code = id2stn.get(p.stone_id)
+            if not cat_code or not stn_code:
                 continue
-            item = {"id": p.id, "title": p.title, "price": p.price, "stock": p.stock,
-                    "description": p.description, "photos": p.photos or []}
-            catalog.PRODUCTS.setdefault((category, stone), []).append(item)
+            item = {
+                "id": p.id,
+                "title": p.title,
+                "price": p.price,
+                "stock": p.stock,
+                "description": p.description,
+                "photos": (p.photos or []),
+            }
+            catalog.PRODUCTS.setdefault((cat_code, stn_code), []).append(item)
             catalog.PRODUCTS_BY_ID[p.id] = item
 
 
@@ -64,3 +81,49 @@ async def init_db_and_load_cache():
     await init_db()
     await ensure_base_ref_data()
     await load_catalog_to_memory()
+
+
+def cache_delete_product(product_id: int) -> None:
+    item = catalog.PRODUCTS_BY_ID.pop(product_id, None)
+    if not item:
+        return
+
+    for key, items in list(catalog.PRODUCTS.items()):
+        catalog.PRODUCTS[key] = [x for x in items if x["id"] != product_id]
+        if not catalog.PRODUCTS[key]:
+            del catalog.PRODUCTS[key]
+
+
+def cache_upsert_product(category: str, stone: str, item: dict) -> None:
+    catalog.PRODUCTS_BY_ID[item["id"]] = item
+    lst = catalog.PRODUCTS.setdefault((category, stone), [])
+    for i, it in enumerate(lst):
+        if it["id"] == item["id"]:
+            lst[i] = item
+            break
+    else:
+        lst.append(item)
+
+
+async def cache_refresh_single(session, product_id: int) -> None:
+    from sqlalchemy import select
+    from app.db.models import Product, Category, Stone
+    row = (await session.execute(
+        select(Product, Category.code, Stone.code)
+        .join(Category, Category.id == Product.category_id)
+        .join(Stone, Stone.id == Product.stone_id)
+        .where(Product.id == product_id)
+    )).first()
+    if not row:
+        cache_delete_product(product_id)
+        return
+    p, cat_code, st_code = row
+    item = {
+        "id": p.id,
+        "title": p.title,
+        "price": p.price,
+        "stock": p.stock,
+        "description": p.description,
+        "photos": p.photos or [],
+    }
+    cache_upsert_product(cat_code, st_code, item)

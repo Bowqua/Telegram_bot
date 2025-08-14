@@ -1,18 +1,19 @@
 ﻿from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo, InputMediaPhoto
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
-from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID
+from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID, CAT_LABELS, STONE_LABELS
 from aiogram.filters import Command, CommandObject, BaseFilter
-from app.db.bootstrap import load_catalog_to_memory
+from app.db.bootstrap import cache_delete_product, cache_refresh_single
 import asyncio, shlex
 from decimal import Decimal
 from typing import List, Tuple
-from aiogram.types import Message
 from sqlalchemy import select, func
 from app.db.session import Session
 from app.db.models import Category, Stone, Product
 from app.utils.slug import slugify_ru
+from contextlib import suppress
+
 
 REMOVE_ON_ZERO = True
 SHOW_DELETE_BUTTON = False
@@ -54,15 +55,8 @@ class WaitsInput(BaseFilter):
         return INPUT_MODE.get(m.from_user.id) is not None
 
 
-async def _ru_labels(category_code: str, stone_code: str) -> tuple[str, str]:
-    async with Session() as s:
-        cat_ru = (await s.execute(
-            select(Category.name_ru).where(Category.code == category_code)
-        )).scalar_one_or_none() or category_code
-        stone_ru = (await s.execute(
-            select(Stone.name_ru).where(Stone.code == stone_code)
-        )).scalar_one_or_none() or stone_code
-    return cat_ru, stone_ru
+def ru_labels(category_code: str, stone_code: str) -> tuple[str, str]:
+    return CAT_LABELS.get(category_code, category_code), STONE_LABELS.get(stone_code, stone_code)
 
 
 async def create_or_get_category(session: Session, name_ru: str) -> Category:
@@ -155,7 +149,7 @@ async def add_product_from_args(m: Message, args: str, photos: List[str] | None)
         s.add(p)
         await s.commit()
         await s.refresh(p)
-    await load_catalog_to_memory()
+        await cache_refresh_single(s, p.id)
 
     await m.answer(
         f"Добавлено: #{p.id}\n"
@@ -205,17 +199,27 @@ def inc_stock(pid: int, n: int = 1) -> None:
 
 
 def render_product_text(p: dict, pos: int, total: int, category: str, stone: str) -> str:
-    return (
-        f"<b>{p['title']}</b>\n"
-        f"Категория: {category}\n"
-        f"Камень: {stone}\n"
-        f"Цена: {p['price']} ₽\n\n"
-        f"В наличии: {p['stock']} шт\n\n"
-        f"Товар {pos+1} из {total}"
-    )
+    lines = [
+        f"<b>{p['title']}</b>",
+        f"Категория: {category}",
+        f"Камень: {stone}",
+        f"Цена: {p['price']} ₽",
+        "",
+        f"В наличии: {p['stock']} шт",
+    ]
+
+    if p.get("description"):
+        lines += ["", p["description"]]
+    lines += ["", f"Товар {pos+1} из {total}"]
+    return "\n".join(lines)
 
 
-def product_keyboard(category: str, stone: str, product_id: int, user_id: int, pos: int, total: int):
+def product_keyboard(
+    category: str, stone: str,
+    product_id: int, user_id: int,
+    pos: int, total: int,
+    img_idx: int = 0
+):
     left_disabled = (pos == 0)
     right_disabled = (pos == total - 1)
     in_stock = PRODUCTS_BY_ID[product_id]["stock"] > 0
@@ -233,7 +237,18 @@ def product_keyboard(category: str, stone: str, product_id: int, user_id: int, p
     row_cart = [InlineKeyboardButton(text=f"🧺 Корзина ({cart_count(user_id)})", callback_data="cart|open|")]
     row_back = [InlineKeyboardButton(text="⬅️ Назад к камням", callback_data=f"catalog2|open|{category}")]
 
-    return InlineKeyboardMarkup(inline_keyboard=[row_nav, row_cart, row_back])
+    rows = []
+
+    photos = (PRODUCTS_BY_ID.get(product_id, {}).get("photos") or [])
+    if len(photos) > 1:
+        rows.append([
+            InlineKeyboardButton(text="◀️", callback_data=f"pimg|prev|{category}:{stone}:{pos}:{img_idx}"),
+            InlineKeyboardButton(text=f"{(img_idx % len(photos)) + 1}/{len(photos)}", callback_data="noop"),
+            InlineKeyboardButton(text="▶️", callback_data=f"pimg|next|{category}:{stone}:{pos}:{img_idx}"),
+        ])
+
+    rows += [row_nav, row_cart, row_back]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def render_product_screen(cb: CallbackQuery, category: str, stone: str, idx: int):
@@ -249,15 +264,14 @@ async def render_product_screen(cb: CallbackQuery, category: str, stone: str, id
         return
 
     idx = max(0, min(idx, len(products) - 1))
-    USER_CTX[cb.from_user.id] = {"key": key, "idx": idx}
+    prev = USER_CTX.get(cb.from_user.id) or {}
+    img_idx = prev.get("img_idx", 0) if prev.get("key") == key and prev.get("idx") == idx else 0
+
+    USER_CTX[cb.from_user.id] = {"key": key, "idx": idx, "img_idx": img_idx}
     p = products[idx]
 
-    cat_ru, stone_ru = await _ru_labels(category, stone)
-    await safe_edit(
-        cb.message,
-        render_product_text(p, idx, len(products), cat_ru, stone_ru),  # ← ПЕРЕДАЁМ РУССКИЕ
-        product_keyboard(category, stone, p["id"], cb.from_user.id, idx, len(products))
-    )
+    await show_product(cb, p, idx, len(products), category, stone, img_idx=img_idx)
+
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(cb: CallbackQuery):
@@ -295,8 +309,7 @@ async def cb_catalog1(cb: CallbackQuery):
         rows = (await s.execute(
             select(Category.code, Category.name_ru).where(Category.code.in_(codes))
         )).all()
-    labels = {code: name_ru for code, name_ru in rows}
-    rows_kb = [[InlineKeyboardButton(text=labels.get(code, code),
+    rows_kb = [[InlineKeyboardButton(text=CAT_LABELS.get(code, code),
                                      callback_data=f"catalog2|open|{code}")]
                for code in codes]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
@@ -322,8 +335,7 @@ async def cb_catalog2(cb: CallbackQuery):
         rows = (await s.execute(
             select(Stone.code, Stone.name_ru).where(Stone.code.in_(stones))
         )).all()
-    labels = {code: name_ru for code, name_ru in rows}
-    rows_kb = [[InlineKeyboardButton(text=labels.get(st, st),
+    rows_kb = [[InlineKeyboardButton(text=STONE_LABELS.get(st, st),
                                      callback_data=f"product|open|{category}:{st}")]
                for st in stones]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
@@ -382,6 +394,38 @@ async def cb_product_add(cb: CallbackQuery):
         category, stone = ctx["key"]
         await render_product_screen(cb, category, stone, ctx.get("idx", 0))
     return await cb.answer("Добавлено в корзину")
+
+
+@router.callback_query(F.data.startswith("pimg|"))
+async def cb_photo_nav(cb: CallbackQuery):
+    try:
+        _p, action, payload = cb.data.split("|", 2)
+        category, stone, idx_s, img_idx_s = payload.split(":", 3)
+        idx = int(idx_s); img_idx = int(img_idx_s)
+    except Exception:
+        return await cb.answer("Ошибка параметров.", show_alert=True)
+
+    key = (category, stone)
+    products = PRODUCTS.get(key, [])
+    if not products:
+        return await cb.answer("Нет товаров.", show_alert=True)
+    if not (0 <= idx < len(products)):
+        return await cb.answer("Нет такого товара.", show_alert=True)
+
+    p = products[idx]
+    photos = p.get("photos") or []
+    if len(photos) < 2:
+        return await cb.answer("Здесь только одно фото.", show_alert=True)
+
+    if action == "prev":
+        img_idx = (img_idx - 1) % len(photos)
+    else:
+        img_idx = (img_idx + 1) % len(photos)
+
+    USER_CTX[cb.from_user.id] = {"key": key, "idx": idx, "img_idx": img_idx}
+
+    await show_product(cb, p, idx, len(products), category, stone, img_idx=img_idx)
+    return await cb.answer()
 
 
 def money(x: int) -> str:
@@ -737,26 +781,21 @@ async def admin_add_text(m: Message, command: CommandObject):
 
 
 @router.message(Command("del"))
-async def admin_del(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id):
-        return
-    if not command.args:
-        return await m.answer("Формат: /del <id>")
+async def admin_del_text(m: Message, command: CommandObject):
+    pid_str = (command.args or "").strip()
+    if not pid_str.isdigit():
+        return await m.answer("Укажи ID: /del 123")
 
-    try:
-        pid = int(command.args.strip())
-    except ValueError:
-        return await m.answer("ID должен быть числом.")
-
+    pid = int(pid_str)
     async with Session() as s:
         p = await s.get(Product, pid)
         if not p:
-            return await m.answer("Товар не найден.")
+            return await m.answer("❌ Товар не найден")
         await s.delete(p)
         await s.commit()
-        await load_catalog_to_memory()
 
-    await m.answer(f"Удалено: #{pid}")
+    cache_delete_product(pid)
+    await m.answer("✅ Удалено")
 
 
 @router.message(Command("set"))
@@ -781,7 +820,7 @@ async def admin_set(m: Message, command: CommandObject):
             return await m.answer("Товар не найден.")
         p.stock = new_stock
         await s.commit()
-        await load_catalog_to_memory()
+        await cache_refresh_single(s, p.id)
 
     await m.answer(f"#{pid}: новое количество = {new_stock}")
 
@@ -803,13 +842,59 @@ async def admin_list(m: Message, command: CommandObject):
         return await m.answer("Список пуст.")
     lines = []
     for p, cat_ru, stone_ru in rows:
-        lines.append(f"#{p.id} • {cat_ru} / {stone_ru}\n{p.title} — {p.price} ₽, {p.stock} шт.")
+        nphotos = len(p.photos or [])
+        has_desc = " + описание" if p.description else ""
+        lines.append(
+            f"#{p.id} • {cat_ru} / {stone_ru}\n{p.title} — {p.price} ₽, {p.stock} шт. (фото: {nphotos}{has_desc})")
     await m.answer("\n\n".join(lines))
 
+
+async def show_product(
+        cb: CallbackQuery,
+        p: dict,
+        idx: int,
+        total: int,
+        category: str,
+        stone: str,
+        img_idx: int = 0,
+) -> None:
+    cat_ru, stone_ru = ru_labels(category, stone)
+    caption = render_product_text(p, idx, total, cat_ru, stone_ru)
+    kb = product_keyboard(category, stone, p["id"], cb.from_user.id, idx, total, img_idx=img_idx)
+
+    photos = p.get("photos") or []
+    if photos:
+        img_idx = img_idx % len(photos)
+        fid = photos[img_idx]
+        media = InputMediaPhoto(media=fid, caption=caption)
+
+        if cb.message.content_type == "photo":
+            try:
+                await cb.message.edit_media(media=media, reply_markup=kb)
+            except TelegramBadRequest:
+                new = await cb.message.answer_photo(fid, caption=caption, reply_markup=kb)
+                with suppress(Exception):
+                    await cb.message.delete()
+
+        else:
+            new = await cb.message.answer_photo(fid, caption=caption, reply_markup=kb)
+            with suppress(Exception):
+                await cb.message.delete()
+
+    else:
+        if cb.message.content_type == "photo":
+            new = await cb.message.answer(caption, reply_markup=kb)
+            with suppress(Exception):
+                await cb.message.delete()
+
+        else:
+            await safe_edit(cb.message, caption, kb)
 
 @router.message(F.photo)
 async def admin_add_single_photo(m: Message):
     if not is_admin(m.from_user.id):
+        return
+    if m.media_group_id:
         return
     if not m.caption or not m.caption.lstrip().startswith("/add"):
         return
@@ -818,10 +903,13 @@ async def admin_add_single_photo(m: Message):
     await add_product_from_args(m, args, photos)
 
 
-ALBUM_BUF: dict[Tuple[int, str], dict] = {}
+ALBUM_BUF: dict[tuple[int, str], dict] = {}
 
-async def _flush_album(key: Tuple[int, str]):
-    await asyncio.sleep(1.0)
+async def flush_album(key):
+    try:
+        await asyncio.sleep(2.5)
+    except asyncio.CancelledError:
+        return
     buf = ALBUM_BUF.pop(key, None)
     if not buf:
         return
@@ -829,9 +917,37 @@ async def _flush_album(key: Tuple[int, str]):
     caption: str | None = buf.get("caption")
     photos: list[str] = buf.get("photos", [])[:5]
     if not caption or not caption.lstrip().startswith("/add"):
+        await m0.answer("Для альбома нет подписи с /add. Укажи /add в подписи одного из фото.")
         return
     args = caption.lstrip()[len("/add"):].strip()
     await add_product_from_args(m0, args, photos)
+
+
+def _reschedule_flush(key):
+    task = ALBUM_BUF[key].get("task")
+    if task and not task.done():
+        task.cancel()
+    ALBUM_BUF[key]["task"] = asyncio.create_task(flush_album(key))
+
+
+@router.message(F.media_group_id & F.photo)
+async def admin_add_album(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    key = (m.chat.id, m.media_group_id)
+    buf = ALBUM_BUF.setdefault(key, {"photos": [], "caption": None, "first_msg": m, "task": None})
+    buf["photos"].append(m.photo[-1].file_id)
+    if m.caption and m.caption.lstrip().startswith("/add"):
+        buf["caption"] = m.caption
+    _reschedule_flush(key)
+
+
+def schedule_album_flush(key: Tuple[int, str]):
+    buf = ALBUM_BUF[key]
+    task: asyncio.Task | None = buf.get("task")
+    if task and not task.done():
+        task.cancel()
+    buf["task"] = asyncio.create_task(flush_album(key))
 
 
 @router.message(F.media_group_id & F.photo)
@@ -841,8 +957,8 @@ async def admin_add_album(m: Message):
     key = (m.chat.id, m.media_group_id)
     buf = ALBUM_BUF.get(key)
     if not buf:
-        buf = ALBUM_BUF[key] = {"photos": [], "caption": None, "first_msg": m}
-        asyncio.create_task(_flush_album(key))
+        buf = ALBUM_BUF[key] = {"photos": [], "caption": None, "first_msg": m, "task": None}
     buf["photos"].append(m.photo[-1].file_id)
     if m.caption and m.caption.lstrip().startswith("/add"):
         buf["caption"] = m.caption
+    schedule_album_flush(key)

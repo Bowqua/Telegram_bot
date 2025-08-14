@@ -1,30 +1,25 @@
-﻿from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.pool import NullPool
+﻿from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from urllib.parse import quote_plus
-from uuid import uuid4
-import ssl
 from app.config import settings
 
-user = settings.PGUSER.strip()
-pwd  = quote_plus(settings.PGPASSWORD)
-host = settings.PGHOST.strip()
-port = int(settings.PGPORT)
-db   = settings.PGDATABASE.strip()
+user = (settings.PGUSER or "").strip()
+pwd  = quote_plus(settings.PGPASSWORD or "")
+host = (settings.PGHOST or "").strip()
+port = settings.PGPORT or 5432
+db   = (settings.PGDATABASE or "").strip()
 
-DB_URL = f"postgresql+asyncpg://{user}:{pwd}@{host}:{port}/{db}?prepared_statement_cache_size=0"
+if settings.DATABASE_URL:
+    DB_URL = settings.DATABASE_URL
+elif user and pwd and host and db:
+    DB_URL = f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{db}"
+else:
+    DB_URL = "sqlite+aiosqlite:///./app.db"
 
-ssl_ctx = ssl.create_default_context()
-ssl_ctx.check_hostname = False
-ssl_ctx.verify_mode = ssl.CERT_NONE
+CONNECT_ARGS = {
+    "prepare_threshold": 0,   #
+    "sslmode": "require",
+}
 
-engine = create_async_engine(
-    DB_URL,
-    pool_pre_ping=True,
-    poolclass=NullPool,
-    connect_args={
-        "ssl": ssl_ctx,
-        "statement_cache_size": 0,
-        "prepared_statement_name_func": lambda: f"__sa_asyncpg_{uuid4()}__",
-    },
-)
-Session = async_sessionmaker(engine, expire_on_commit=False)
+engine = create_async_engine(DB_URL, pool_pre_ping=True, future=True,
+                             connect_args=CONNECT_ARGS)
+Session: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
