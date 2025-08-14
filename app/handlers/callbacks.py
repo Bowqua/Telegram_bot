@@ -6,10 +6,10 @@ from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID, CAT_LABELS, STONE_LABELS
 from aiogram.filters import Command, CommandObject, BaseFilter
-from app.db.bootstrap import cache_delete_product, cache_refresh_single
+from app.db.bootstrap import cache_delete_product, cache_refresh_single, load_catalog_to_memory
 import asyncio, shlex
 from decimal import Decimal
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete, or_
 from app.db.session import Session
 from app.db.models import Category, Stone, Product
 from app.utils.slug import slugify_ru
@@ -67,48 +67,66 @@ def ru_labels(category_code: str, stone_code: str) -> tuple[str, str]:
     return CAT_LABELS.get(category_code, category_code), STONE_LABELS.get(stone_code, stone_code)
 
 
-async def create_or_get_category(session: Session, name_ru: str) -> Category:
+async def get_or_create_category(session: Session, name_ru: str) -> Category:
     name_ru = name_ru.strip()
-    c = (await session.execute(
-        select(Category).where(func.lower(Category.name_ru) == func.lower(name_ru))
-    )).scalar_one_or_none()
-
-    if c:
-        return c
     code = slugify_ru(name_ru)
-    postfix = 1
-    base = code
+    row = (await session.execute(select(Category).where((Category.code == code) | (Category.name_ru == name_ru)))).scalar_one_or_none()
 
-    while (await session.execute(select(Category).where(Category.code == code))).scalar_one_or_none():
-        postfix += 1
-        code = f"{base}-{postfix}"
+    if row:
+        return row
 
-    c = Category(code=code, name_ru=name_ru)
-    session.add(c)
+    row = Category(code=code, name_ru=name_ru)
+    session.add(row)
     await session.flush()
-    return c
+    return row
 
 
-async def create_or_get_stone(session: Session, name_ru: str) -> Stone:
+async def get_or_create_stone(session: Session, name_ru: str) -> Stone:
     name_ru = name_ru.strip()
-    s = (await session.execute(
-        select(Stone).where(func.lower(Stone.name_ru) == func.lower(name_ru))
-    )).scalar_one_or_none()
-
-    if s:
-        return s
     code = slugify_ru(name_ru)
-    postfix = 1
-    base = code
+    row = (await session.execute(select(Stone).where((Stone.code == code) | (Stone.name_ru == name_ru)))).scalar_one_or_none()
 
-    while (await session.execute(select(Stone).where(Stone.code == code))).scalar_one_or_none():
-        postfix += 1
-        code = f"{base}-{postfix}"
+    if row:
+        return row
 
-    s = Stone(code=code, name_ru=name_ru)
-    session.add(s)
+    row = Stone(code=code, name_ru=name_ru)
+    session.add(row)
     await session.flush()
-    return s
+    return row
+
+
+async def find_category_by_term(session: Session, term: str) -> Category | None:
+    term = term.strip()
+    if not term:
+        return None
+    code = slugify_ru(term)
+    return (
+        await session.execute(
+            select(Category).where(
+                or_(
+                    func.lower(Category.name_ru) == func.lower(term),
+                    Category.code == code,
+                )
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def find_stone_by_term(session: Session, term: str) -> Stone | None:
+    term = term.strip()
+    if not term:
+        return None
+    code = slugify_ru(term)
+    return (
+        await session.execute(
+            select(Stone).where(
+                or_(
+                    func.lower(Stone.name_ru) == func.lower(term),
+                    Stone.code == code,
+                )
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def add_product_from_args(m: Message, args: str, photos: List[str] | None):
@@ -137,8 +155,8 @@ async def add_product_from_args(m: Message, args: str, photos: List[str] | None)
     photos = (photos or [])[:5]
 
     async with Session() as s:
-        cat = await create_or_get_category(s, cat_ru)
-        stn = await create_or_get_stone(s, stone_ru)
+        cat = await get_or_create_category(s, cat_ru)
+        stn = await get_or_create_stone(s, stone_ru)
 
         exists = (await s.execute(
             select(Product.id)
@@ -213,13 +231,13 @@ def render_product_text(p: dict, pos: int, total: int, category: str, stone: str
         f"Категория: {category}",
         f"Камень: {stone}",
         f"Цена: {p['price']} ₽",
-        "",
-        f"В наличии: {p['stock']} шт",
     ]
 
-    if p.get("description"):
-        lines += ["", p["description"]]
-    lines += ["", f"Товар {pos+1} из {total}"]
+    desc = (p.get("description") or "").strip()
+    if desc:
+        lines += ["", "<b>Описание:</b>", desc]
+
+    lines += ["", f"В наличии: {p['stock']} шт", "", f"Товар {pos+1} из {total}"]
     return "\n".join(lines)
 
 
@@ -726,18 +744,58 @@ async def cb_payment_mock_success(cb: CallbackQuery):
 @router.message(Command("admin"))
 async def cmd_admin_help(m: Message):
     if not is_admin(m.from_user.id):
-        return await m.answer("⛔ Нет доступа.")
-    await m.answer(
-        "Админ-команды:\n"
-        "<code>/add &lt;категория&gt; &lt;камень&gt; \"Название\" &lt;цена&gt; &lt;остаток&gt; [\"Описание\"]</code>\n"
-        "<code>/del &lt;id&gt;</code>\n"
-        "<code>/set &lt;id&gt; &lt;кол-во&gt;</code>\n"
-        "<code>/list</code>\n\n"
+        return
+
+    txt = (
+        "<b>Команды админа</b>\n\n"
+
+        "<b>/add</b>\n"
+        "<code>/add &lt;категория&gt; &lt;камень&gt; &quot;&lt;название&gt;&quot; "
+        "&lt;цена&gt; &lt;кол-во&gt; [&quot;&lt;описание&gt;&quot;]</code>\n"
         "Примеры:\n"
-        "<code>/add браслеты аметист \"Браслет Морозный\" 3990 4 \"Серебро 925\"</code>\n"
+        "<code>/add браслеты аметист \"Заря\" 1234 1\n</code>"
+        "<code>/add колье цитрин \"Солнечный путь\" 2490 3 \"Длина 45 см\"</code>\n\n"
+
+        "<b>/set</b>\n"
+        "<code>/set &lt;id&gt; &lt;кол-во|+n|-n&gt;</code>\n"
+        "<code>/set &lt;id&gt; stock &lt;кол-во|+n|-n&gt;</code>\n"
+        "<code>/set &lt;id&gt; price &lt;цена&gt;</code>\n"
+        "<code>/set &lt;id&gt; title &lt;новое название&gt;</code>\n"
+        "<code>/set &lt;id&gt; desc &lt;текст|-&gt;</code>\n"
+        "<code>/set &lt;id&gt; category &lt;тип&gt;</code>\n"
+        "<code>/set &lt;id&gt; stone &lt;камень&gt;</code>\n"
+        "Примеры:\n"
+        "<code>/set 25 +2</code>\n"
+        "<code>/set 25 stock 0</code>\n"
+        "<code>/set 25 price 1490</code>\n"
+        "<code>/set 25 title Небесная гроза</code>\n"
+        "<code>/set 25 desc Ожерелье диаметра 15 см</code>\n"
+        "<code>/set 25 category браслеты</code>\n"
+        "<code>/set 25 stone аметист</code>\n\n"
+
+        "<b>/del</b>\n"
+        "<code>/del &lt;id&gt;</code>\n"
+        "<code>/del &lt;id1,id2,id3&gt;</code>\n"
+        "<code>/del &lt;id1 id2 id3&gt;</code>\n"
+        "Примеры:\n"
         "<code>/del 42</code>\n"
-        "<code>/set 42 7</code>"
+        "<code>/del 7, 12, 15</code>\n"
+        "<code>/del 7 12 15</code>\n\n"
+
+        "<b>/list</b>\n"
+        "<code>/list</code>\n"
+        "<code>/list category &lt;тип&gt;</code>\n"
+        "<code>/list stone &lt;камень&gt;</code>\n"
+        "<code>/list &lt;тип&gt; &lt;камень&gt;</code>\n"
+        "Примеры:\n"
+        "<code>/list</code>\n"
+        "<code>/list category браслеты</code>\n"
+        "<code>/list stone аметист</code>\n"
+        "<code>/list браслеты аметист</code>\n"
     )
+
+    await m.answer(txt)
+
 
 
 @router.message(Command("add"), ~F.photo, ~F.media_group_id)
@@ -749,70 +807,243 @@ async def admin_add_text(m: Message, command: CommandObject):
 
 @router.message(Command("del"))
 async def admin_del_text(m: Message, command: CommandObject):
-    pid_str = (command.args or "").strip()
-    if not pid_str.isdigit():
-        return await m.answer("Укажи ID: /del 123")
+    if not is_admin(m.from_user.id):
+        return
 
-    pid = int(pid_str)
+    raw = (command.args or "").strip()
+    ids = [int(x) for x in re.findall(r"\d+", raw)]
+    if not ids:
+        return await m.answer("Укажи ID(ы): /del 123  или  /del 1,2,3")
+
+    ids = sorted(set(ids))
     async with Session() as s:
-        p = await s.get(Product, pid)
-        if not p:
-            return await m.answer("❌ Товар не найден")
-        await s.delete(p)
+        found = (await s.execute(select(Product.id).where(Product.id.in_(ids)))).scalars().all()
+        if not found:
+            return await m.answer("Ни одного товара с такими ID не найдено.")
+        await s.execute(delete(Product).where(Product.id.in_(found)))
         await s.commit()
 
-    cache_delete_product(pid)
-    await m.answer("✅ Удалено")
+    for pid in found:
+        cache_delete_product(pid)
+
+    not_found = [str(i) for i in ids if i not in set(found)]
+    msg = [f"✅ Удалено: {', '.join(map(str, found))}"]
+    if not_found:
+        msg.append(f"⚠️ Не найдены: {', '.join(not_found)}")
+    await m.answer("\n".join(msg))
 
 
 @router.message(Command("set"))
-async def admin_set(m: Message, command: CommandObject):
-    if not is_admin(m.from_user.id):
-        return
-    if not command.args:
-        return await m.answer("Формат: /set <id> <stock>  (например: /set 42 7)")
-
-    parts = command.args.split()
-    if len(parts) != 2:
-        return await m.answer("Формат: /set <id> <stock>")
+async def admin_set(message: Message, command: CommandObject):
+    args = shlex.split(command.args or "")
+    if len(args) < 2:
+        return await message.answer(
+            "Как пользоваться:\n"
+            "/set <id> <кол-во|+n|-n>\n"
+            "/set <id> stock <кол-во|+n|-n>\n"
+            "/set <id> price <цена>\n"
+            "/set <id> title <название>\n"
+            "/set <id> desc <текст|->\n"
+            "/set <id> category <тип (рус.)>\n"
+            "/set <id> stone <камень (рус.)>"
+        )
 
     try:
-        pid = int(parts[0]); new_stock = int(parts[1])
+        pid = int(args[0])
     except ValueError:
-        return await m.answer("ID и stock должны быть числами.")
+        return await message.answer("Первый аргумент — это ID товара (число).")
 
     async with Session() as s:
-        p = await s.get(Product, pid)
+        p: Product | None = await s.get(Product, pid)
         if not p:
-            return await m.answer("Товар не найден.")
-        p.stock = new_stock
+            return await message.answer(f"Товар с id={pid} не найден.")
+
+        if len(args) == 2 and args[1]:
+            delta = args[1]
+            if delta.startswith(("+", "-")):
+                try:
+                    diff = int(delta)
+                except ValueError:
+                    return await message.answer("Количество должно быть числом (например, +2 или -1).")
+                p.stock = max(0, p.stock + diff)
+            else:
+                try:
+                    qty = int(delta)
+                except ValueError:
+                    return await message.answer("Количество должно быть числом.")
+                p.stock = max(0, qty)
+            await s.commit()
+            await load_catalog_to_memory()
+            return await message.answer(f"✅ Обновлено: ID #{p.id}\nНовое количество: {p.stock}")
+
+        if len(args) < 3:
+            return await message.answer("Не хватает значения. Пример: /set 12 price 1490")
+
+        field = args[1].lower()
+        value = " ".join(args[2:]).strip()
+
+        if field in ("stock", "qty", "количество"):
+            if value.startswith(("+", "-")):
+                try:
+                    diff = int(value)
+                except ValueError:
+                    return await message.answer("Количество должно быть числом (например, +2 или -1).")
+                p.stock = max(0, p.stock + diff)
+            else:
+                try:
+                    qty = int(value)
+                except ValueError:
+                    return await message.answer("Количество должно быть числом.")
+                p.stock = max(0, qty)
+
+        elif field in ("price", "стоимость"):
+            try:
+                price = int(value)
+            except ValueError:
+                return await message.answer("Цена должна быть числом (без пробелов).")
+            if price < 0:
+                return await message.answer("Цена не может быть отрицательной.")
+            p.price = price
+
+        elif field in ("title", "name", "название"):
+            if not value:
+                return await message.answer("Название не может быть пустым.")
+            p.title = value
+
+        elif field in ("desc", "описание"):
+            if value in ("-", "—", "none", "нет"):
+                p.description = ""
+            else:
+                p.description = value
+
+        elif field in ("category", "категория", "type", "тип"):
+            cat = await get_or_create_category(s, value)
+            p.category_id = cat.id
+
+        elif field in ("stone", "камень"):
+            st = await get_or_create_stone(s, value)
+            p.stone_id = st.id
+
+        else:
+            return await message.answer(
+                "Неизвестное поле. Можно: stock, price, title, desc, category, stone."
+            )
+
         await s.commit()
-        await cache_refresh_single(s, p.id)
+        await s.refresh(p)
+        await load_catalog_to_memory()
 
-    await m.answer(f"#{pid}: новое количество = {new_stock}")
+        try:
+            cat = (await s.get(Category, p.category_id)).name_ru
+            stn = (await s.get(Stone, p.stone_id)).name_ru
+        except Exception:
+            cat, stn = "—", "—"
 
+    text = render_product_text(
+        {
+            "id": p.id,
+            "title": p.title,
+            "price": p.price,
+            "stock": p.stock,
+            "description": p.description or "",
+        },
+        pos=0,
+        total=1,
+        category=cat,
+        stone=stn,
+    )
+    await message.answer("✅ Обновлено.\n\n" + text)
 
 
 @router.message(Command("list"))
 async def admin_list(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
         return
+
+    args = (command.args or "").strip()
+    if args.lower() in {"types", "категории"}:
+        async with Session() as session:
+            rows = (await session.execute(
+                select(Category.name_ru, func.count(Product.id))
+                .join(Product, Product.category_id == Category.id)
+                .group_by(Category.id, Category.name_ru)
+                .order_by(Category.name_ru.asc())
+            )).all()
+
+        if not rows:
+            return await m.answer("Категорий пока нет.")
+        text = "\n".join(f"• {name} — {cnt} шт." for name, cnt in rows)
+        return await m.answer("<b>По ассортиментам</b>:\n" + text)
+
+    if args.lower() in {"stones", "камни"}:
+        async with Session() as session:
+            rows = (await session.execute(
+                select(Stone.name_ru, func.count(Product.id))
+                .join(Product, Product.stone_id == Stone.id)
+                .group_by(Stone.id, Stone.name_ru)
+                .order_by(Stone.name_ru.asc())
+            )).all()
+
+            if not rows:
+                return await m.answer("Камней пока нет.")
+            text = "\n".join(f"• {name} — {cnt} шт." for name, cnt in rows)
+            return await m.answer("<b>По камням</b>:\n" + text)
+
+    terms = shlex.split(args) if args else []
     async with Session() as s:
-        rows = (await s.execute(
+        cat = stn = None
+
+        if len(terms) == 1:
+            t = terms[0]
+            c = await find_category_by_term(s, t)
+            s_ = await find_stone_by_term(s, t)
+            if c and not s_:
+                cat = c
+            elif s_ and not c:
+                stn = s_
+            elif c and s_:
+                return await m.answer(
+                    "Уточни, это категория или камень?\n"
+                    "Можно явно указать два слова: <code>/list &lt;категория&gt; &lt;камень&gt;</code>\n"
+                    "Либо посмотреть агрегаты: <code>/list types</code> или <code>/list stones</code>"
+                )
+            else:
+                return await m.answer("Ничего не найдено по этому слову.")
+        elif len(terms) >= 2:
+            cat = await find_category_by_term(s, terms[0])
+            stn = await find_stone_by_term(s, " ".join(terms[1:])) if len(terms) > 2 else await find_stone_by_term(s, terms[1])
+            if not cat and not stn:
+                return await m.answer("Не удалось распознать ни категорию, ни камень.")
+        q = (
             select(Product, Category.name_ru, Stone.name_ru)
             .join(Category, Product.category_id == Category.id)
             .join(Stone, Product.stone_id == Stone.id)
             .order_by(Product.id.desc())
             .limit(30)
-        )).all()
+        )
+
+        if cat:
+            q = q.where(Product.category_id == cat.id)
+        if stn:
+            q = q.where(Product.stone_id == stn.id)
+        rows = (await s.execute(q)).all()
+
     if not rows:
-        return await m.answer("Список пуст.")
+        label = []
+        if cat: label.append(cat.name_ru)
+        if stn: label.append(stn.name_ru)
+        hint = f" по фильтру: {' / '.join(label)}" if label else ""
+        return await m.answer(f"Список пуст{hint}.")
+
     lines = []
     for p, cat_ru, stone_ru in rows:
         nphotos = len(p.photos or [])
         has_desc = " + описание" if p.description else ""
         lines.append(
-            f"#{p.id} • {cat_ru} / {stone_ru}\n{p.title} — {p.price} ₽, {p.stock} шт. (фото: {nphotos}{has_desc})")
+            f"#{p.id} • {cat_ru} / {stone_ru}\n"
+            f"{p.title} — {p.price} ₽, {p.stock} шт. (фото: {nphotos}{has_desc})"
+        )
+
     await m.answer("\n\n".join(lines))
 
 
