@@ -1,5 +1,7 @@
-﻿from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo, InputMediaPhoto
+﻿import re
+
+from aiogram import F, Router
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, InputMediaPhoto
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID, CAT_LABELS, STONE_LABELS
@@ -7,13 +9,12 @@ from aiogram.filters import Command, CommandObject, BaseFilter
 from app.db.bootstrap import cache_delete_product, cache_refresh_single
 import asyncio, shlex
 from decimal import Decimal
-from typing import List, Tuple
 from sqlalchemy import select, func
 from app.db.session import Session
 from app.db.models import Category, Stone, Product
 from app.utils.slug import slugify_ru
 from contextlib import suppress
-
+from typing import Dict, List
 
 REMOVE_ON_ZERO = True
 SHOW_DELETE_BUTTON = False
@@ -26,6 +27,9 @@ USER_CTX = {}
 CART = {}
 DELIVERY_CTX = {}
 INPUT_MODE = {}
+
+album_buffers: Dict[str, dict] = {}
+ALBUM_SETTLE_SEC = 0.9
 
 ADMIN_IDS = {920975453, 6888030186}
 
@@ -107,6 +111,7 @@ async def add_product_from_args(m: Message, args: str, photos: List[str] | None)
     if not is_admin(m.from_user.id):
         return
     try:
+        args = re.sub(r"[«»“”]", '"', args)
         parts = shlex.split(args)
     except ValueError:
         return await m.answer('Неверный синтаксис. Пример:\n'
@@ -715,47 +720,6 @@ async def cb_payment_mock_success(cb: CallbackQuery):
     return await cb.answer()
 
 
-def _next_product_id() -> int:
-    return (max(PRODUCTS_BY_ID.keys()) + 1) if PRODUCTS_BY_ID else 100
-
-
-def add_product_mem(category: str, stone: str, title: str, price: int, stock: int) -> int:
-    pid = _next_product_id()
-    p = {"id": pid, "title": title.strip(), "price": int(price), "stock": int(stock)}
-    PRODUCTS.setdefault((category, stone), []).append(p)
-    PRODUCTS_BY_ID[pid] = p
-    return pid
-
-
-def delete_product_mem(pid: int) -> bool:
-    if pid not in PRODUCTS_BY_ID:
-        return False
-    del PRODUCTS_BY_ID[pid]
-    to_del_keys = []
-    for key, items in PRODUCTS.items():
-        new_items = [it for it in items if it["id"] != pid]
-        if len(new_items) != len(items):
-            PRODUCTS[key] = new_items
-        if not new_items:
-            to_del_keys.append(key)
-    for k in to_del_keys:
-        del PRODUCTS[k]
-    if "CART" in globals():
-        for uid in list(CART.keys()):
-            CART[uid].pop(pid, None)
-            if not CART[uid]:
-                CART[uid] = {}
-    return True
-
-
-def set_stock_mem(pid: int, qty: int) -> bool:
-    p = PRODUCTS_BY_ID.get(pid)
-    if not p:
-        return False
-    p["stock"] = max(0, int(qty))
-    return True
-
-
 @router.message(Command("admin"))
 async def cmd_admin_help(m: Message):
     if not is_admin(m.from_user.id):
@@ -773,7 +737,7 @@ async def cmd_admin_help(m: Message):
     )
 
 
-@router.message(Command("add"))
+@router.message(Command("add"), ~F.photo, ~F.media_group_id)
 async def admin_add_text(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
         return
@@ -890,75 +854,63 @@ async def show_product(
         else:
             await safe_edit(cb.message, caption, kb)
 
-@router.message(F.photo)
-async def admin_add_single_photo(m: Message):
+@router.message(F.photo & ~F.media_group_id)
+async def admin_add_one_photo(m: Message):
     if not is_admin(m.from_user.id):
         return
-    if m.media_group_id:
+    cap = (m.caption or "").strip()
+    if not cap.startswith("/add"):
         return
-    if not m.caption or not m.caption.lstrip().startswith("/add"):
-        return
-    args = m.caption.lstrip()[len("/add"):].strip()
-    photos = [m.photo[-1].file_id]
-    await add_product_from_args(m, args, photos)
+    args_text = cap.split(None, 1)[1] if " " in cap else ""
+    await add_product_from_args(m, args_text, photos=[m.photo[-1].file_id])
 
 
-ALBUM_BUF: dict[tuple[int, str], dict] = {}
-
-async def flush_album(key):
-    try:
-        await asyncio.sleep(2.5)
-    except asyncio.CancelledError:
+@router.message(F.media_group_id)
+async def album_collect_unified(m: Message):
+    if not is_admin(m.from_user.id):
         return
-    buf = ALBUM_BUF.pop(key, None)
+
+    mgid = m.media_group_id
+    buf = album_buffers.get(mgid)
+    if not buf:
+        buf = {
+            "chat_id": m.chat.id,
+            "message": m,
+            "caption": None,
+            "photos": [],
+            "task": None,
+            "admin_id": m.from_user.id,
+        }
+        album_buffers[mgid] = buf
+
+    if m.photo:
+        fid = m.photo[-1].file_id
+        if fid not in buf["photos"]:
+            buf["photos"].append(fid)
+
+    if m.caption and m.caption.lstrip().startswith("/add") and not buf.get("caption"):
+        buf["caption"] = m.caption
+        buf["message"] = m
+
+    if buf.get("task"):
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(finalize_album_after_pause(mgid))
+
+
+async def finalize_album_after_pause(mgid: str):
+    await asyncio.sleep(ALBUM_SETTLE_SEC)
+    buf = album_buffers.pop(mgid, None)
     if not buf:
         return
-    m0: Message = buf["first_msg"]
-    caption: str | None = buf.get("caption")
-    photos: list[str] = buf.get("photos", [])[:5]
-    if not caption or not caption.lstrip().startswith("/add"):
-        await m0.answer("Для альбома нет подписи с /add. Укажи /add в подписи одного из фото.")
+    if not is_admin(buf["admin_id"]):
         return
-    args = caption.lstrip()[len("/add"):].strip()
-    await add_product_from_args(m0, args, photos)
 
-
-def _reschedule_flush(key):
-    task = ALBUM_BUF[key].get("task")
-    if task and not task.done():
-        task.cancel()
-    ALBUM_BUF[key]["task"] = asyncio.create_task(flush_album(key))
-
-
-@router.message(F.media_group_id & F.photo)
-async def admin_add_album(m: Message):
-    if not is_admin(m.from_user.id):
+    caption = (buf["caption"] or "").lstrip()
+    if not caption.startswith("/add"):
         return
-    key = (m.chat.id, m.media_group_id)
-    buf = ALBUM_BUF.setdefault(key, {"photos": [], "caption": None, "first_msg": m, "task": None})
-    buf["photos"].append(m.photo[-1].file_id)
-    if m.caption and m.caption.lstrip().startswith("/add"):
-        buf["caption"] = m.caption
-    _reschedule_flush(key)
 
+    photos = list(dict.fromkeys(buf["photos"]))[:5]
+    parts = caption.split(None, 1)
+    args_text = parts[1] if len(parts) == 2 else ""
 
-def schedule_album_flush(key: Tuple[int, str]):
-    buf = ALBUM_BUF[key]
-    task: asyncio.Task | None = buf.get("task")
-    if task and not task.done():
-        task.cancel()
-    buf["task"] = asyncio.create_task(flush_album(key))
-
-
-@router.message(F.media_group_id & F.photo)
-async def admin_add_album(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    key = (m.chat.id, m.media_group_id)
-    buf = ALBUM_BUF.get(key)
-    if not buf:
-        buf = ALBUM_BUF[key] = {"photos": [], "caption": None, "first_msg": m, "task": None}
-    buf["photos"].append(m.photo[-1].file_id)
-    if m.caption and m.caption.lstrip().startswith("/add"):
-        buf["caption"] = m.caption
-    schedule_album_flush(key)
+    await add_product_from_args(buf["message"], args_text, photos=photos)
