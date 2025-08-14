@@ -46,12 +46,16 @@ def is_email(s: str) -> bool:
     return "@" in s and "." in s.split("@")[-1] and " " not in s
 
 
-async def safe_edit(message, text, reply_markup):
+async def safe_edit(message, text, reply_markup=None):
     try:
         await message.edit_text(text, reply_markup=reply_markup)
     except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
-            raise
+        s = str(e)
+        if "message is not modified" in s:
+            return
+        with suppress(Exception):
+            new = await message.answer(text, reply_markup=reply_markup)
+            await message.delete()
 
 
 class WaitsInput(BaseFilter):
@@ -260,7 +264,7 @@ async def render_product_screen(cb: CallbackQuery, category: str, stone: str, id
     key = (category, stone)
     products = PRODUCTS.get(key, [])
     if not products:
-        await cb.message.edit_text(
+        await safe_edit(cb.message,
             "Пока нет товаров для выбранной комбинации",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад к камням", callback_data=f"catalog2|open|{category}")]
@@ -285,7 +289,7 @@ async def cb_noop(cb: CallbackQuery):
 
 @router.callback_query(F.data == "welcome|open|")
 async def cb_welcome(cb: CallbackQuery):
-    await cb.message.edit_text("👋 Добро пожаловать! Это черновик приветствия.\n\nВыберите действие ниже.",
+    await safe_edit(cb.message, "👋 Добро пожаловать! Это черновик приветствия.\n\nВыберите действие ниже.",
                                reply_markup=keyboard_welcome())
     return await cb.answer()
 
@@ -295,7 +299,7 @@ async def cb_contacts(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")]
     ])
-    await cb.message.edit_text("📲 Связь с менеджером:\nUsername with @\nПричины: обмен, кастом и т.д.",
+    await safe_edit(cb.message, "📲 Связь с менеджером:\nUsername with @\nПричины: обмен, кастом и т.д.",
                                reply_markup=kb)
     return await cb.answer()
 
@@ -307,7 +311,7 @@ async def cb_catalog1(cb: CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")]
                 ])
-        await cb.message.edit_text("Пока нет категорий.", reply_markup=kb)
+        await safe_edit(cb.message, "Пока нет категорий.", reply_markup=kb)
         return await cb.answer()
 
     async with Session() as s:
@@ -318,8 +322,8 @@ async def cb_catalog1(cb: CallbackQuery):
                                      callback_data=f"catalog2|open|{code}")]
                for code in codes]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
-    await cb.message.edit_text("Выберите ассортимент:",
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb))
+    await safe_edit(cb.message, "Выберите ассортимент:",
+                    InlineKeyboardMarkup(inline_keyboard=rows_kb))
     return await cb.answer()
 
 
@@ -329,11 +333,11 @@ async def cb_catalog2(cb: CallbackQuery):
     stones = sorted({stone for (cat, stone) in PRODUCTS.keys() if cat == category})
 
     if not stones:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")]
-        ])
-        await cb.message.edit_text(f"Для категории «{category}» пока нет камней. Добавьте товары через админ-команды.",
-                                   reply_markup=kb)
+        await safe_edit(cb.message,
+                        f"Для категории «{category}» пока нет камней.",
+                        InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")]
+                        ]))
         return await cb.answer()
 
     async with Session() as s:
@@ -344,8 +348,7 @@ async def cb_catalog2(cb: CallbackQuery):
                                      callback_data=f"product|open|{category}:{st}")]
                for st in stones]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
-    await cb.message.edit_text("Выберите камень для категории:",
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb))
+    await safe_edit(cb.message,"Выберите камень для категории:", InlineKeyboardMarkup(inline_keyboard=rows_kb))
     return await cb.answer()
 
 
@@ -494,7 +497,7 @@ async def render_cart(cb: CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data="product|nav|prev")]
         ])
-        await cb.message.edit_text("Корзина пуста.", reply_markup=kb)
+        await safe_edit(cb.message, "Корзина пуста.", reply_markup=kb)
         return
 
     lines, total_qty, total_sum = cart_totals(cb.from_user.id)
@@ -854,47 +857,36 @@ async def show_product(
         else:
             await safe_edit(cb.message, caption, kb)
 
-@router.message(F.photo & ~F.media_group_id)
-async def admin_add_one_photo(m: Message):
+@router.message(Command("add"), F.photo, ~F.media_group_id)
+async def admin_add_single_photo(m: Message, command: CommandObject):
     if not is_admin(m.from_user.id):
         return
+    fid = m.photo[-1].file_id
+    await add_product_from_args(m, command.args or "", photos=[fid])
+
+
+@router.message(F.photo, ~F.media_group_id, ~F.caption.startswith("/add"))
+async def admin_photo_without_add(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    await m.reply("Чтобы прикрепить фото к товару, добавь команду в подпись: "
+                  "<code>/add &lt;категория&gt; &lt;камень&gt; \"Название\" &lt;цена&gt; &lt;остаток&gt; [\"Описание\"]</code>")
+
+
+@router.message(F.media_group_id, F.photo)
+async def collect_album(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    mgid = str(m.media_group_id)
+    buf = album_buffers.setdefault(mgid, {"admin_id": m.from_user.id, "photos": [], "args_text": None, "message": m})
+    buf["photos"].append(m.photo[-1].file_id)
+    buf["message"] = m
+
     cap = (m.caption or "").strip()
-    if not cap.startswith("/add"):
-        return
-    args_text = cap.split(None, 1)[1] if " " in cap else ""
-    await add_product_from_args(m, args_text, photos=[m.photo[-1].file_id])
+    if cap.startswith("/add"):
+        buf["args_text"] = cap.split(None, 1)[1] if " " in cap else ""
 
-
-@router.message(F.media_group_id)
-async def album_collect_unified(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-
-    mgid = m.media_group_id
-    buf = album_buffers.get(mgid)
-    if not buf:
-        buf = {
-            "chat_id": m.chat.id,
-            "message": m,
-            "caption": None,
-            "photos": [],
-            "task": None,
-            "admin_id": m.from_user.id,
-        }
-        album_buffers[mgid] = buf
-
-    if m.photo:
-        fid = m.photo[-1].file_id
-        if fid not in buf["photos"]:
-            buf["photos"].append(fid)
-
-    if m.caption and m.caption.lstrip().startswith("/add") and not buf.get("caption"):
-        buf["caption"] = m.caption
-        buf["message"] = m
-
-    if buf.get("task"):
-        buf["task"].cancel()
-    buf["task"] = asyncio.create_task(finalize_album_after_pause(mgid))
+    asyncio.create_task(finalize_album_after_pause(mgid))
 
 
 async def finalize_album_after_pause(mgid: str):
@@ -905,12 +897,13 @@ async def finalize_album_after_pause(mgid: str):
     if not is_admin(buf["admin_id"]):
         return
 
-    caption = (buf["caption"] or "").lstrip()
-    if not caption.startswith("/add"):
-        return
-
     photos = list(dict.fromkeys(buf["photos"]))[:5]
-    parts = caption.split(None, 1)
-    args_text = parts[1] if len(parts) == 2 else ""
 
-    await add_product_from_args(buf["message"], args_text, photos=photos)
+    if buf["args_text"]:
+        await add_product_from_args(buf["message"], buf["args_text"], photos=photos)
+    else:
+        await buf["message"].reply(
+            "В подписи альбома не найдено /add. "
+            "Отправь альбом заново с подписью вида:\n"
+            "<code>/add &lt;категория&gt; &lt;камень&gt; \"Название\" &lt;цена&gt; &lt;остаток&gt; [\"Описание\"]</code>"
+        )
