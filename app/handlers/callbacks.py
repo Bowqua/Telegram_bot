@@ -65,6 +65,10 @@ async def safe_edit(message, text, reply_markup=None):
             await message.delete()
 
 
+def uc_first(s: str) -> str:
+    return s[:1].upper() + s[1:] if s else s
+
+
 def touch_cart(user_id: int) -> None:
     CART_META[user_id] = time.time()
 
@@ -88,7 +92,7 @@ class WaitsInput(BaseFilter):
 
 
 def ru_labels(category_code: str, stone_code: str) -> tuple[str, str]:
-    return CAT_LABELS.get(category_code, category_code), STONE_LABELS.get(stone_code, stone_code)
+    return uc_first(CAT_LABELS.get(category_code, category_code)), uc_first(STONE_LABELS.get(stone_code, stone_code))
 
 
 async def get_or_create_category(session: Session, name_ru: str) -> Category:
@@ -362,7 +366,7 @@ async def cb_catalog1(cb: CallbackQuery):
         )).all()
 
     labels = {code: name_ru for code, name_ru in rows}
-    rows_kb = [[InlineKeyboardButton(text=labels.get(code, CAT_LABELS.get(code, code)),
+    rows_kb = [[InlineKeyboardButton(text=uc_first(labels.get(code, CAT_LABELS.get(code, code))),
                                      callback_data=f"catalog2|open|{code}")]
                for code in codes]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
@@ -390,7 +394,7 @@ async def cb_catalog2(cb: CallbackQuery):
         )).all()
 
     labels = {code: name_ru for code, name_ru in rows}
-    rows_kb = [[InlineKeyboardButton(text=labels.get(st, STONE_LABELS.get(st, st)),
+    rows_kb = [[InlineKeyboardButton(text=uc_first(labels.get(st, STONE_LABELS.get(st, st))),
                                      callback_data=f"product|open|{category}:{st}")]
                for st in stones]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
