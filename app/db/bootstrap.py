@@ -1,4 +1,4 @@
-﻿from sqlalchemy import select, text
+﻿from sqlalchemy import select, delete, exists
 from app.db.session import engine, Session
 from app.db.models import Base, Category, Stone, Product
 from app.data import catalog
@@ -32,14 +32,7 @@ async def init_db():
 
 
 async def ensure_base_ref_data():
-    async with Session() as s:
-        for code, name_ru in [("bracelets", "Браслеты"), ("necklaces", "Ожерелья")]:
-            if not (await s.execute(select(Category).where(Category.code == code))).scalar_one_or_none():
-                s.add(Category(code=code, name_ru=name_ru))
-        for code, name_ru in [("amethyst", "Аметист"), ("citrine", "Цитрин"), ("garnet", "Гранат")]:
-            if not (await s.execute(select(Stone).where(Stone.code == code))).scalar_one_or_none():
-                s.add(Stone(code=code, name_ru=name_ru))
-        await s.commit()
+        return
 
 
 async def load_catalog_to_memory():
@@ -127,3 +120,20 @@ async def cache_refresh_single(session, product_id: int) -> None:
         "photos": p.photos or [],
     }
     cache_upsert_product(cat_code, st_code, item)
+
+
+async def cleanup_orphan_refs():
+    async with Session() as session:
+        await session.execute(
+            delete(Category).where(
+                ~exists(select(Product.id).where(Product.category_id == Category.id))
+            )
+        )
+
+        await session.execute(
+            delete(Stone).where(
+                ~exists(select(Product.id).where(Product.stone_id == Stone.id))
+            )
+        )
+
+        await session.commit()

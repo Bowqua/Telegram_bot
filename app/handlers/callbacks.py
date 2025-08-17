@@ -1,37 +1,44 @@
 ﻿import re
+import asyncio, shlex
+import time
 
-from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, InputMediaPhoto
+from aiogram import F, Router, Bot
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, PreCheckoutQuery, Message, InputMediaPhoto
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+
+from app.data import catalog
 from app.data.catalog import PRODUCTS, PRODUCTS_BY_ID, CAT_LABELS, STONE_LABELS
 from aiogram.filters import Command, CommandObject, BaseFilter
-from app.db.bootstrap import cache_delete_product, cache_refresh_single, load_catalog_to_memory
-import asyncio, shlex
+from app.db.bootstrap import cache_delete_product, cache_refresh_single, load_catalog_to_memory, cleanup_orphan_refs
 from decimal import Decimal
 from sqlalchemy import select, func, delete, or_
 from app.db.session import Session
-from app.db.models import Category, Stone, Product
+from app.db.models import Category, Stone, Product, Order, OrderItem, OrderStatus
 from app.utils.slug import slugify_ru
 from contextlib import suppress
 from typing import Dict, List
+from app.config import MANAGER_IDS
 
 REMOVE_ON_ZERO = True
 SHOW_DELETE_BUTTON = False
 SHOW_LABEL_ROW = False
+DELETE_PRODUCT_WHEN_STOCK_ZERO = True
 
 load_dotenv()
 router = Router()
 
 USER_CTX = {}
 CART = {}
+CART_TTL_SEC = 60 * 60 * 12
+CART_META: dict[int, float] = {}
 DELIVERY_CTX = {}
 INPUT_MODE = {}
 
 album_buffers: Dict[str, dict] = {}
 ALBUM_SETTLE_SEC = 0.9
 
-ADMIN_IDS = {920975453, 6888030186}
+ADMIN_IDS = {920975453} #6888030186
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -56,6 +63,23 @@ async def safe_edit(message, text, reply_markup=None):
         with suppress(Exception):
             new = await message.answer(text, reply_markup=reply_markup)
             await message.delete()
+
+
+def touch_cart(user_id: int) -> None:
+    CART_META[user_id] = time.time()
+
+
+def purge_expired_carts() -> None:
+    now = time.time()
+    stale = [uid for uid, ts in CART_META.items() if now - ts > CART_TTL_SEC]
+    for uid in stale:
+        for pid, qty in (CART.get(uid, {}) or {}).items():
+            inc_stock(pid, qty)
+
+        CART.pop(uid, None)
+        DELIVERY_CTX.pop(uid, None)
+        USER_CTX.pop(uid, None)
+        CART_META.pop(uid, None)
 
 
 class WaitsInput(BaseFilter):
@@ -336,7 +360,9 @@ async def cb_catalog1(cb: CallbackQuery):
         rows = (await s.execute(
             select(Category.code, Category.name_ru).where(Category.code.in_(codes))
         )).all()
-    rows_kb = [[InlineKeyboardButton(text=CAT_LABELS.get(code, code),
+
+    labels = {code: name_ru for code, name_ru in rows}
+    rows_kb = [[InlineKeyboardButton(text=labels.get(code, CAT_LABELS.get(code, code)),
                                      callback_data=f"catalog2|open|{code}")]
                for code in codes]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="welcome|open|")])
@@ -362,7 +388,9 @@ async def cb_catalog2(cb: CallbackQuery):
         rows = (await s.execute(
             select(Stone.code, Stone.name_ru).where(Stone.code.in_(stones))
         )).all()
-    rows_kb = [[InlineKeyboardButton(text=STONE_LABELS.get(st, st),
+
+    labels = {code: name_ru for code, name_ru in rows}
+    rows_kb = [[InlineKeyboardButton(text=labels.get(st, STONE_LABELS.get(st, st)),
                                      callback_data=f"product|open|{category}:{st}")]
                for st in stones]
     rows_kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")])
@@ -372,20 +400,38 @@ async def cb_catalog2(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("product|open|"))
 async def cb_product_open(cb: CallbackQuery):
-    try:
-        category, stone = cb.data.split("|", 2)[-1].split(":", 1)
-    except ValueError:
-        category, stone = "bracelets", "amethyst"
+    payload = cb.data.split("|", 2)[-1]
+    if ":" not in payload:
+        if PRODUCTS:
+            category, stone = next(iter(PRODUCTS.keys()))
+        else:
+            await safe_edit(
+                cb.message,
+                "Каталог пуст.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog1|open|")]
+                ])
+            )
+            return await cb.answer()
+    else:
+        category, stone = payload.split(":", 1)
+
     await render_product_screen(cb, category, stone, idx=0)
     return await cb.answer()
-
 
 @router.callback_query(F.data == "product|nav|next")
 async def cb_product_next(cb: CallbackQuery):
     ctx = USER_CTX.get(cb.from_user.id)
     if not ctx:
-        await render_product_screen(cb, "bracelets", "amethyst", 0)
+        await safe_edit(
+            cb.message,
+            "Выберите ассортимент:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть каталог", callback_data="catalog1|open|")]
+            ])
+        )
         return await cb.answer()
+
     category, stone = ctx["key"]
     await render_product_screen(cb, category, stone, ctx.get("idx", 0) + 1)
     return await cb.answer()
@@ -395,8 +441,15 @@ async def cb_product_next(cb: CallbackQuery):
 async def cb_product_prev(cb: CallbackQuery):
     ctx = USER_CTX.get(cb.from_user.id)
     if not ctx:
-        await render_product_screen(cb, "bracelets", "amethyst", 0)
+        await safe_edit(
+            cb.message,
+            "Выберите ассортимент:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть каталог", callback_data="catalog1|open|")]
+            ])
+        )
         return await cb.answer()
+
     category, stone = ctx["key"]
     await render_product_screen(cb, category, stone, ctx.get("idx", 0) - 1)
     return await cb.answer()
@@ -404,6 +457,7 @@ async def cb_product_prev(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("product|add|"))
 async def cb_product_add(cb: CallbackQuery):
+    purge_expired_carts()
     pid = int(cb.data.split("|", 2)[-1])
     if not dec_stock(pid, 1):
         ctx = USER_CTX.get(cb.from_user.id)
@@ -414,6 +468,7 @@ async def cb_product_add(cb: CallbackQuery):
 
     CART.setdefault(cb.from_user.id, {})
     CART[cb.from_user.id][pid] = CART[cb.from_user.id].get(pid, 0) + 1
+    touch_cart(cb.from_user.id)
 
     ctx = USER_CTX.get(cb.from_user.id)
     if ctx:
@@ -454,6 +509,69 @@ async def cb_photo_nav(cb: CallbackQuery):
     return await cb.answer()
 
 
+def cart_photo_kb(pid: int, idx: int, total: int):
+    back = InlineKeyboardButton(text="⬅️ Вернуться в корзину", callback_data="cart|open|")
+
+    if total <= 1:
+        return InlineKeyboardMarkup(inline_keyboard=[[back]])
+
+    left  = InlineKeyboardButton(text="◀️", callback_data=f"cartimg|nav|prev|{pid}:{idx}")
+    mid   = InlineKeyboardButton(text=f"{(idx % total)+1}/{total}", callback_data="noop")
+    right = InlineKeyboardButton(text="▶️", callback_data=f"cartimg|nav|next|{pid}:{idx}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[[left, mid, right], [back]])
+
+
+async def render_cart_photo(cb: CallbackQuery, pid: int, idx: int):
+    p = PRODUCTS_BY_ID.get(pid)
+    if not p:
+        return await cb.answer("Товар не найден.", show_alert=True)
+    photos = p.get("photos") or []
+    if not photos:
+        return await cb.answer("У товара нет фото.", show_alert=True)
+
+    idx = idx % len(photos)
+    fid = photos[idx]
+    caption = f"📷 {p['title']}\nФото {idx+1} из {len(photos)}"
+    kb = cart_photo_kb(pid, idx, len(photos))
+    media = InputMediaPhoto(media=fid, caption=caption)
+
+    if cb.message.content_type == "photo":
+        try:
+            await cb.message.edit_media(media=media, reply_markup=kb)
+        except TelegramBadRequest:
+            new = await cb.message.answer_photo(fid, caption=caption, reply_markup=kb)
+            with suppress(Exception):
+                await cb.message.delete()
+    else:
+        new = await cb.message.answer_photo(fid, caption=caption, reply_markup=kb)
+        with suppress(Exception):
+            await cb.message.delete()
+
+
+@router.callback_query(F.data.startswith("cartimg|open|"))
+async def cb_cartimg_open(cb: CallbackQuery):
+    payload = cb.data.split("|", 2)[-1]
+    pid_s, idx_s = payload.split(":")
+    await render_cart_photo(cb, int(pid_s), int(idx_s))
+    return await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cartimg|nav|"))
+async def cb_cartimg_nav(cb: CallbackQuery):
+    _, _, direction, payload = cb.data.split("|", 3)
+    pid_s, idx_s = payload.split(":")
+    pid, idx = int(pid_s), int(idx_s)
+
+    photos = (PRODUCTS_BY_ID.get(pid, {}) or {}).get("photos") or []
+    if len(photos) < 2:
+        return await cb.answer("Здесь только одно фото.", show_alert=True)
+
+    idx = (idx - 1) % len(photos) if direction == "prev" else (idx + 1) % len(photos)
+    await render_cart_photo(cb, pid, idx)
+    return await cb.answer()
+
+
 def money(x: int) -> str:
     return f"{x:,}".replace(",", " ") + " ₽"
 
@@ -491,7 +609,7 @@ def cart_keyboard(user_id: int, lines):
         can_inc = PRODUCTS_BY_ID[p["id"]]["stock"] > 0
         row = [
             InlineKeyboardButton(text=circ_num(i), callback_data="noop"),
-            InlineKeyboardButton(text="–",   callback_data=f"cart|dec|{p['id']}"),
+            InlineKeyboardButton(text="–", callback_data=f"cart|dec|{p['id']}"),
             InlineKeyboardButton(text=f"x{qty}", callback_data="noop"),
             InlineKeyboardButton(
                 text=("+" if can_inc else "🚫"),
@@ -503,9 +621,14 @@ def cart_keyboard(user_id: int, lines):
             row.append(InlineKeyboardButton(text="Удалить", callback_data=f"cart|del|{p['id']}"))
         rows.append(row)
 
+        if p.get("photos") or []:
+            rows.append([
+                InlineKeyboardButton(text="📷 Фото", callback_data=f"cartimg|open|{p['id']}:0"),
+            ])
+
     rows.append([InlineKeyboardButton(text="Очистить", callback_data="cart|clear|")])
     rows.append([InlineKeyboardButton(text="Перейти к службе доставки", callback_data="delivery|open|")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data="product|nav|prev")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data="catalog1|open|")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -513,7 +636,7 @@ async def render_cart(cb: CallbackQuery):
     items = CART.get(cb.from_user.id, {})
     if not items:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data="product|nav|prev")]
+            [InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data="catalog1|open|")]
         ])
         await safe_edit(cb.message, "Корзина пуста.", reply_markup=kb)
         return
@@ -530,6 +653,7 @@ async def render_cart(cb: CallbackQuery):
 
 @router.callback_query(F.data == "cart|open|")
 async def cb_cart_open(cb: CallbackQuery):
+    purge_expired_carts()
     await render_cart(cb)
     return await cb.answer()
 
@@ -591,12 +715,34 @@ async def cb_cart_del(cb: CallbackQuery):
 
 @router.callback_query(F.data == "cart|clear|")
 async def cb_cart_clear(cb: CallbackQuery):
+    purge_expired_carts()
     items = CART.get(cb.from_user.id, {})
     for pid, qty in items.items():
         inc_stock(pid, qty)
     CART[cb.from_user.id] = {}
+    CART_META.pop(cb.from_user.id, None)
     await render_cart(cb)
     return await cb.answer("Очищено")
+
+
+PENDING_ORDERS: dict[str, dict] = {}
+
+
+def build_cart_snapshot(user_id: int) -> dict:
+    items = []
+    for pid, qty in CART.get(user_id, {}).items():
+        if qty > 0:
+            p = catalog.PRODUCTS_BY_ID.get(pid)
+            if p:
+                items.append({
+                    "pid": pid,
+                    "title": p["title"],
+                    "price": p["price"],
+                    "qty": qty,
+                    "photos": p.get("photos", []),
+                })
+    total_rub = sum(it["price"] * it["qty"] for it in items)
+    return {"items": items, "total_rub": total_rub}
 
 
 def carrier_label(code: str | None) -> str:
@@ -638,10 +784,28 @@ def delivery_form_keyboard(user_id: int):
         [InlineKeyboardButton(text=("🏷 Изменить адрес/ПВЗ" if ctx.get("address") else "🏷 Ввести адрес/ПВЗ"),
                               callback_data="delivery|ask_address|")],
         [InlineKeyboardButton(text=("Перейти к оплате" if filled else "Перейти к оплате — заполните данные"),
-                              callback_data=("payment|start|current" if filled else "noop"))],
+                              callback_data=("delivery:open" if filled else "noop"))],
         [InlineKeyboardButton(text="⬅️ Сменить службу", callback_data="delivery|choose|")],
         [InlineKeyboardButton(text="⬅️ Назад в корзину", callback_data="cart|open|")],
     ])
+
+
+def rub_to_kopecks(rub: int | float) -> int:
+    return int(round(float(rub) * 100))
+
+
+def cart_to_prices(items: list[dict]) -> list[LabeledPrice]:
+    prices = []
+    for it in items:
+        label = f'{it["title"]} × {it["qty"]}'
+        amount = rub_to_kopecks(it["price"] * it["qty"])
+        prices.append(LabeledPrice(label=label, amount=amount))
+    return prices
+
+
+def make_invoice_description(items: list[dict]) -> str:
+    lines = [f'{it["title"]} × {it["qty"]} — {it["price"]} ₽' for it in items]
+    return "\n".join(lines) if lines else "Позиции не найдены"
 
 
 @router.callback_query(F.data == "delivery|open|")
@@ -715,6 +879,12 @@ async def on_text_input(m: Message):
     await m.answer(delivery_form_text(m.from_user.id), reply_markup=delivery_form_keyboard(m.from_user.id))
 
 
+@router.callback_query(F.data == "delivery|show|")
+async def cb_delivery_show(cb: CallbackQuery):
+    await safe_edit(cb.message, delivery_form_text(cb.from_user.id), delivery_form_keyboard(cb.from_user.id))
+    return await cb.answer()
+
+
 @router.callback_query(F.data == "payment|start|current")
 async def cb_payment_start(cb: CallbackQuery):
     ctx = DELIVERY_CTX.get(cb.from_user.id) or {}
@@ -725,14 +895,14 @@ async def cb_payment_start(cb: CallbackQuery):
                     "💳 (Заглушка) Оплата: здесь будет выставление счёта.",
                     InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="✅ Провести оплату", callback_data="payment|mock_success|")],
-                        [InlineKeyboardButton(text="⬅️ Назад к доставке", callback_data="delivery|open|")],
+                        [InlineKeyboardButton(text="⬅️ Назад к доставке", callback_data="delivery|show|")],
                     ]))
     return await cb.answer()
 
 
 @router.callback_query(F.data == "payment|mock_success|")
 async def cb_payment_mock_success(cb: CallbackQuery):
-    clear_cart(cb.from_user.id, restore_stock=True) # !!!!!!! в бизнесе нужно поставить на False
+    clear_cart(cb.from_user.id, restore_stock=False)
     await safe_edit(cb.message, "🎉 Спасибо за покупку! Сейчас будет выдан трек.",
                     InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="⬅️ В каталог", callback_data="catalog1|open|")],
@@ -758,7 +928,6 @@ async def cmd_admin_help(m: Message):
 
         "<b>/set</b>\n"
         "<code>/set &lt;id&gt; &lt;кол-во|+n|-n&gt;</code>\n"
-        "<code>/set &lt;id&gt; stock &lt;кол-во|+n|-n&gt;</code>\n"
         "<code>/set &lt;id&gt; price &lt;цена&gt;</code>\n"
         "<code>/set &lt;id&gt; title &lt;новое название&gt;</code>\n"
         "<code>/set &lt;id&gt; desc &lt;текст|-&gt;</code>\n"
@@ -766,7 +935,6 @@ async def cmd_admin_help(m: Message):
         "<code>/set &lt;id&gt; stone &lt;камень&gt;</code>\n"
         "Примеры:\n"
         "<code>/set 25 +2</code>\n"
-        "<code>/set 25 stock 0</code>\n"
         "<code>/set 25 price 1490</code>\n"
         "<code>/set 25 title Небесная гроза</code>\n"
         "<code>/set 25 desc Ожерелье диаметра 15 см</code>\n"
@@ -825,6 +993,7 @@ async def admin_del_text(m: Message, command: CommandObject):
 
     for pid in found:
         cache_delete_product(pid)
+    await cleanup_orphan_refs()
 
     not_found = [str(i) for i in ids if i not in set(found)]
     msg = [f"✅ Удалено: {', '.join(map(str, found))}"]
@@ -840,7 +1009,6 @@ async def admin_set(message: Message, command: CommandObject):
         return await message.answer(
             "Как пользоваться:\n"
             "/set <id> <кол-во|+n|-n>\n"
-            "/set <id> stock <кол-во|+n|-n>\n"
             "/set <id> price <цена>\n"
             "/set <id> title <название>\n"
             "/set <id> desc <текст|->\n"
@@ -882,21 +1050,7 @@ async def admin_set(message: Message, command: CommandObject):
         field = args[1].lower()
         value = " ".join(args[2:]).strip()
 
-        if field in ("stock", "qty", "количество"):
-            if value.startswith(("+", "-")):
-                try:
-                    diff = int(value)
-                except ValueError:
-                    return await message.answer("Количество должно быть числом (например, +2 или -1).")
-                p.stock = max(0, p.stock + diff)
-            else:
-                try:
-                    qty = int(value)
-                except ValueError:
-                    return await message.answer("Количество должно быть числом.")
-                p.stock = max(0, qty)
-
-        elif field in ("price", "стоимость"):
+        if field in ("price", "стоимость"):
             try:
                 price = int(value)
             except ValueError:
@@ -1138,3 +1292,100 @@ async def finalize_album_after_pause(mgid: str):
             "Отправь альбом заново с подписью вида:\n"
             "<code>/add &lt;категория&gt; &lt;камень&gt; \"Название\" &lt;цена&gt; &lt;остаток&gt; [\"Описание\"]</code>"
         )
+
+
+@router.pre_checkout_query()
+async def pre_checkout(pre: PreCheckoutQuery, bot: Bot):
+    await pre.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def on_success_payment(m: Message, bot: Bot):
+    sp = m.successful_payment
+    payload = sp.invoice_payload
+    snap = PENDING_ORDERS.pop(payload, None)
+    if not snap:
+        await m.answer("Не удалось найти заказ по платежу.")
+        return
+
+    async with Session() as s:
+        order = Order(
+            user_id=snap["user_id"],
+            chat_id=snap["chat_id"],
+            full_name=m.from_user.full_name or "",
+            username=m.from_user.username or "",
+            currency=snap["currency"],
+            total_amount=snap["total_kop"],
+            payload=payload,
+            status=OrderStatus.paid,
+        )
+        s.add(order)
+        await s.flush()
+
+        for it in snap["items"]:
+            pid = it["pid"]
+            qty = it["qty"]
+
+            p: Product | None = await s.get(Product, pid)
+            if not p:
+                continue
+
+            real_qty = min(qty, max(0, p.stock))
+            s.add(OrderItem(
+                order_id=order.id,
+                product_id=pid,
+                title=p.title,
+                price=rub_to_kopecks(it["price"]),
+                qty=real_qty,
+                photos=it.get("photos", []),
+            ))
+
+            p.stock = max(0, p.stock - real_qty)
+            if DELETE_PRODUCT_WHEN_STOCK_ZERO and p.stock == 0:
+                await s.delete(p)
+                cache_delete_product(pid)
+            else:
+                await cache_refresh_single(s, pid)
+
+        await s.commit()
+        await cleanup_orphan_refs()
+
+    CART[m.from_user.id] = {}
+    CART_META.pop(m.from_user.id, None)
+
+    await m.answer("Спасибо за покупку! ✨")
+    await notify_managers_about_order(bot, m, order, snap)
+
+
+async def notify_managers_about_order(bot: Bot, m: Message, order: Order, snap: dict):
+    user = m.from_user
+    lines = [
+        f"🧾 <b>Новый заказ #{order.id}</b>",
+        f"Покупатель: <a href='tg://user?id={user.id}'>{user.full_name}</a> @{user.username or '—'}",
+        f"Способ: самовывоз",
+        f"Сумма: {order.total_amount / 100:.2f} {order.currency}",
+        "",
+        "Состав:",
+    ]
+    for it in snap["items"]:
+        lines.append(f"• {it['title']} — {it['price']} ₽ × {it['qty']}")
+
+    text = "\n".join(lines)
+
+    for admin_id in MANAGER_IDS:
+        try:
+            await bot.send_message(admin_id, text, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+        for it in snap["items"]:
+            photos = (it.get("photos") or [])[:5]
+            if not photos:
+                continue
+            media = [InputMediaPhoto(media=ph) for ph in photos]
+            try:
+                await bot.send_media_group(admin_id, media)
+            except Exception:
+                for ph in photos:
+                    with suppress(Exception):
+                        await bot.send_photo(admin_id, ph)
