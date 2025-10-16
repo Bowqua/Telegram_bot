@@ -38,7 +38,7 @@ INPUT_MODE = {}
 album_buffers: Dict[str, dict] = {}
 ALBUM_SETTLE_SEC = 0.9
 
-ADMIN_IDS = {920975453} #6888030186
+ADMIN_IDS = {920975453}
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
