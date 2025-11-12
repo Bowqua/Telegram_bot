@@ -33,9 +33,8 @@ class Product(Base):
     title: Mapped[str] = mapped_column(String(256), index=True)
     price: Mapped[int] = mapped_column(Integer)
     stock: Mapped[int] = mapped_column(Integer)
-    description: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     photos: Mapped[list] = mapped_column(json_type, default=list, nullable=False)
-
     category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"))
     stone_id:    Mapped[int] = mapped_column(ForeignKey("stones.id"))
     category = relationship("Category", back_populates="products")
@@ -74,6 +73,6 @@ class OrderItem(Base):
     title = mapped_column(String(255), nullable=False)
     price = mapped_column(Integer, nullable=False)
     qty = mapped_column(Integer, nullable=False)
-    photos = mapped_column(JSONB, default=list)
+    photos = mapped_column(json_type, default=list, nullable=False)
 
     order = relationship("Order", back_populates="items")
