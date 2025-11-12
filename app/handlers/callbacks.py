@@ -18,7 +18,7 @@ from app.db.models import Category, Stone, Product, Order, OrderItem, OrderStatu
 from app.utils.slug import slugify_ru
 from contextlib import suppress
 from typing import Dict, List
-from app.config import MANAGER_IDS
+from app.config import settings
 
 REMOVE_ON_ZERO = True
 SHOW_DELETE_BUTTON = False
@@ -38,10 +38,10 @@ INPUT_MODE = {}
 album_buffers: Dict[str, dict] = {}
 ALBUM_SETTLE_SEC = 0.9
 
-ADMIN_IDS = {920975453}
+ADMINS_IDS=set(settings.ADMIN_IDS)
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id in settings.ADMIN_IDS
 
 
 def norm_phone(s: str) -> str | None:
@@ -1376,7 +1376,7 @@ async def notify_managers_about_order(bot: Bot, m: Message, order: Order, snap: 
 
     text = "\n".join(lines)
 
-    for admin_id in MANAGER_IDS:
+    for admin_id in settings.MANAGER_IDS:
         try:
             await bot.send_message(admin_id, text, disable_web_page_preview=True)
         except Exception:
